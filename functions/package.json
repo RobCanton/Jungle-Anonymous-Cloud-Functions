@@ -1,0 +1,25 @@
+{
+    "name": "functions",
+    "description": "Cloud Functions for Firebase",
+    "scripts": {
+        "serve": "firebase serve --only functions",
+        "shell": "firebase experimental:functions:shell",
+        "start": "npm run shell",
+        "deploy": "firebase deploy --only functions",
+        "logs": "firebase functions:log"
+    },
+    "dependencies": {
+        "algoliasearch": "^3.24.12",
+        "dotenv": "^5.0.1",
+        "find-hashtags": "^1.0.1",
+        "firebase": "^4.10.1",
+        "firebase-admin": "^5.12.1",
+        "firebase-functions": "^1.0.3",
+        "install": "^0.11.0",
+        "keyword-extractor": "*",
+        "node-geocoder": "*",
+        "promise-reflect": "*",
+        "swearjar": "^0.2.0"
+    },
+    "private": true
+}
