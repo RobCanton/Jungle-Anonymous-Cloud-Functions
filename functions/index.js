@@ -12,6 +12,8 @@ const utilities = require('./utilities.js');
 const findHashtags = require('find-hashtags');
 const GOOGLE_PLACES_API_KEY = 'AIzaSyCTo6ejt9CDHW0BpbyhTQ8rcHfgTnDZZ2g';
 const swearjar = require('swearjar');
+var decay = require('decay');
+var hackerHotScore = decay.hackerHot();
 
 const anonymizer = require('./anonymizer.js');
 anonymizer.setup(admin, database, firestore);
@@ -86,13 +88,13 @@ exports.deleteAllUsers = functions.https.onRequest((req, res) => {
 
 exports.cleanUp = functions.https.onRequest((req, res) => {
 
-    var now = new Date();
     var tenMinutesAgo = Date.now() - 3 * 60 * 1000
     var batchSize = 20;
     var removedPostsRef = firestore.collection('posts')
         .where('removedAt', '<', tenMinutesAgo)
         .orderBy('removedAt');
     var query = removedPostsRef.limit(batchSize);
+
     return new Promise((resolve, reject) => {
         deleteQueryBatch(firestore, query, batchSize, resolve, reject);
     }).then(() => {
@@ -108,14 +110,48 @@ exports.cleanUp = functions.https.onRequest((req, res) => {
     });
 });
 
+
+exports.trendingTags = functions.https.onCall((data, context) => {
+    const uid = context.auth.uid;
+
+    // Checking that the user is authenticated.
+    if (!context.auth) {
+        // Throwing an HttpsError so that the client gets the error details.
+        throw new functions.https.HttpsError('failed-precondition', 'The function must be called ' +
+            'while authenticated.');
+    }
+    
+    const getTrendingTags = database.ref(`trending/hashtags`).once('value');
+    return getTrendingTags.then(snapshot => {
+        var trendingData = snapshot.val();
+        snapshot.forEach(function (tag) {
+            const data = tag.val();
+            const posts = data.posts;
+            var postsArray = [];
+            for (var key in posts) {
+                var post = posts[key];
+                post['isYou'] = post.uid === uid;
+                delete post.uid;
+                console.log(`${key}: ${util.inspect(post, false, null)}`);
+                postsArray.push(post);
+            }
+            trendingData[tag.key]['posts'] = postsArray;
+
+        });
+
+        return trendingData;
+    });
+});
+
 exports.calculateTrending = functions.https.onRequest((req, res) => {
 
     var now = new Date();
-    var oneWeekAgo = new Date(now.getTime() - (60 * 60 * 24 * 7 * 1000));
+    var oneWeekAgo = Date.now() - (60 * 60 * 24 * 7 * 1000);
+
     const getAllFacets = postsAdminIndex.search({
         facets: ['hashtags'],
         maxValuesPerFacet: 10,
-        numericFilters: 'createdAt > 1531886240936'
+        numericFilters: `createdAt > ${oneWeekAgo}`
     });
 
     var trendingHashtags = [];
@@ -155,7 +191,6 @@ exports.calculateTrending = functions.https.onRequest((req, res) => {
                 var hit = result.hits[j];
                 hit.id = hit.objectID;
                 delete hit.objectID;
-                delete hit.uid;
                 delete hit._geoloc;
                 delete hit._highlightResult;
                 delete hit.anon.uid;
@@ -421,6 +456,8 @@ exports.addPost = functions.https.onCall((data, context) => {
 
         var metaObject = {
             author: uid,
+            status: 'active',
+            createdAt: createdAt,
             lexicon: lexicon
         };
 
@@ -480,6 +517,8 @@ exports.addComment = functions.https.onCall((data, context) => {
     var postAuthor;
     var lexicon = {};
 
+    var createdAt = Date.now();
+
     const getPostMeta = database.ref(`posts/meta/${postID}`).once('value');
     return getPostMeta.then(result => {
         if (result.exists()) {
@@ -501,7 +540,7 @@ exports.addComment = functions.https.onCall((data, context) => {
             "anon": anonObject,
             "text": text,
             "textClean": textClean,
-            "createdAt": Date.now(),
+            "createdAt": createdAt,
             "parent": postID,
             "status": "active",
             "numReplies": 0,
@@ -524,6 +563,8 @@ exports.addComment = functions.https.onCall((data, context) => {
         replyID = ref.id;
         var updateObject = {};
         updateObject[`posts/meta/${replyID}/author`] = uid;
+        updateObject[`posts/meta/${replyID}/status`] = 'active';
+        updateObject[`posts/meta/${replyID}/createdAt`] = createdAt;
         updateObject[`posts/meta/${replyID}/parent`] = postID;
 
         updateObject[`posts/replies/${postID}/${replyID}`] = true;
@@ -1285,6 +1326,26 @@ exports.timeoutsUpdater = functions.https.onRequest((req, res) => {
     })
 });
 
+exports.calculateAllPostScores = functions.https.onRequest((req, res) => {
+    const getActivePosts = database.ref(`posts/meta`).orderByChild('status').equalTo('active').once('value');
+    return getActivePosts.then(results => {
+        var o = {};
+        results.forEach(function (post) {
+            o[`posts/meta/${post.key}/needsUpdate`] = true;
+        });
+
+        return database.ref().update(o);
+    }).then(() => {
+        return res.send({
+            success: true
+        });
+    }).catch(e => {
+        return res.send({
+            success: false
+        });
+    });
+});
+
 exports.tasksWorker = functions.https.onRequest((req, res) => {
     const getUpdatedPosts = database.ref(`posts/meta`).orderByChild('needsUpdate').equalTo(true).once('value');
     var postIDs = [];
@@ -1307,15 +1368,17 @@ exports.tasksWorker = functions.https.onRequest((req, res) => {
                 promises.push(database.ref().update(updateObject));
             } else {
                 const postRef = firestore.collection('posts').doc(postID);
-                const metaObject = {
+                var m = {
                     numLikes: data.numLikes != null ? data.numLikes : 0,
                     numReplies: data.numReplies != null ? data.numReplies : 0,
                     numCommenters: data.numCommenters != null ? data.numCommenters : 0,
                     reports: data.reports != null ? data.reports : 0,
-                    score: 0
                 };
 
-                promises.push(postRef.update(metaObject));
+                const score = hackerHotScore(m.numLikes + m.numCommenters, new Date(data.createdAt));
+                m['score'] = score;
+                console.log("POST SCORE: ", score, " M: ", m);
+                promises.push(postRef.update(m));
             }
         });
         return Promise.all(promises);
@@ -1337,82 +1400,7 @@ exports.tasksWorker = functions.https.onRequest((req, res) => {
     })
 });
 
-//exports.calculatePostMeta = functions.database.ref('posts/meta/{postID}').onWrite((change, context) => {
-//    const postID = context.params.postID;
-//    const data = change.after.val();
-//    const prevDataExists = change.before.exists();
-//    var author;
-//    var metaObject = {
-//        score: 0,
-//        numLikes: 0,
-//        numReplies: 0,
-//        reports: {
-//            inappropriate: 0,
-//            spam: 0
-//        }
-//    };
-//
-//    var numSubscribers = 0;
-//
-//    if (data != null) {
-//        author = data.author;
-//
-//        if (data.numLikes != null) {
-//            metaObject.numLikes = data.numLikes;
-//        }
-//
-//        if (data.replies != null) {
-//            metaObject.numReplies = data.replies;
-//        }
-//
-//        if (data.subscribers != null) {
-//            for (uid in data.subscribers) {
-//                numSubscribers += 1;
-//            }
-//        }
-//
-//        const reports = data.reports;
-//        if (reports != null) {
-//            if (reports.inappropriate != null) {
-//                metaObject.reports.inappropriate = reports.inappropriate;
-//            }
-//
-//            if (reports.spam != null) {
-//                metaObject.reports.spam = reports.spam;
-//            }
-//        }
-//
-//        metaObject.score = metaObject.numLikes + numSubscribers;
-//    } else {
-//        return Promise.resolve();
-//    }
-//
-//    const postRef = firestore.collection('posts').doc(postID);
-//
-//    return postRef.update(metaObject).then(() => {
-//        var searchMetaObject = metaObject;
-//        searchMetaObject['objectID'] = postID;
-//        const objects = [searchMetaObject];
-//
-//        if (data.author != null) {
-//            if (data.parent != null) {
-//                const updateSearchObject = commentsAdminIndex.partialUpdateObjects(objects, true);
-//                return updateSearchObject;
-//            } else {
-//                const updateSearchObject = postsAdminIndex.partialUpdateObjects(objects, true);
-//                return updateSearchObject;
-//            }
-//        } else {
-//            return Promise.resolve();
-//        }
-//
-//    }).catch(e => {
-//        console.log("Error: ", e);
-//        return Promise.resolve();
-//    })
-//});
-
-exports.updatePostLikes = functions.database.ref('posts/likes/{postID}/{uid}').onWrite((change, context) => {
+exports.postUpdateLikes = functions.database.ref('posts/likes/{postID}/{uid}').onWrite((change, context) => {
     const postID = context.params.postID;
     const uid = context.params.uid;
 
@@ -1446,7 +1434,7 @@ exports.updatePostLikes = functions.database.ref('posts/likes/{postID}/{uid}').o
     });
 });
 
-exports.updatePostReplies = functions.database.ref('posts/replies/{postID}/{replyID}').onWrite((change, context) => {
+exports.postUpdateReplies = functions.database.ref('posts/replies/{postID}/{replyID}').onWrite((change, context) => {
     const postID = context.params.postID;
 
     const prevData = change.before.val();
@@ -1467,7 +1455,7 @@ exports.updatePostReplies = functions.database.ref('posts/replies/{postID}/{repl
     });
 });
 
-exports.updatePostCommenters = functions.database.ref('posts/commenters/{postID}/{uid}').onWrite((change, context) => {
+exports.postUpdateCommenters = functions.database.ref('posts/commenters/{postID}/{uid}').onWrite((change, context) => {
     const postID = context.params.postID;
 
     const prevData = change.before.val();
@@ -1488,7 +1476,7 @@ exports.updatePostCommenters = functions.database.ref('posts/commenters/{postID}
     });
 });
 
-exports.updatePostReports = functions.database.ref('posts/reports/{postID}/{uid}').onWrite((change, context) => {
+exports.postUpdateReports = functions.database.ref('posts/reports/{postID}/{uid}').onWrite((change, context) => {
     const postID = context.params.postID;
     const uid = context.params.uid;
 
@@ -1668,7 +1656,7 @@ exports.sendUserNotification = functions.database.ref('users/notifications/{uid}
 });
 
 
-exports.removePost = functions.https.onCall((data, context) => {
+exports.postRemove = functions.https.onCall((data, context) => {
     // Message text passed from the client.
     const postID = data.postID;
     // Authentication / user information is automatically added to the request.
@@ -1766,13 +1754,13 @@ exports.removePost = functions.https.onCall((data, context) => {
     });
 });
 
-exports.decimatePost = functions.firestore.document('posts/{postID}').onDelete((change, context) => {
+exports.postDelete = functions.firestore.document('posts/{postID}').onDelete((change, context) => {
     const postID = context.params.postID;
     const deletePostMeta = database.ref(`posts/meta/${postID}`).remove();
     return deletePostMeta;
 });
 
-exports.updatePost = functions.firestore.document('posts/{postID}').onUpdate((change, context) => {
+exports.postUpdate = functions.firestore.document('posts/{postID}').onUpdate((change, context) => {
     const postID = context.params.postID;
     const data = change.after.data();
 
@@ -1831,6 +1819,7 @@ exports.updatePost = functions.firestore.document('posts/{postID}').onUpdate((ch
             var updateObject = {};
             updateObject[`posts/meta/${postID}/needsUpdate`] = true;
             updateObject[`posts/meta/${postID}/needsRemoval`] = true;
+            updateObject[`posts/meta/${postID}/status`] = 'removed';
             return database.ref().update(updateObject);
         }).then(() => {
 
@@ -1854,18 +1843,18 @@ exports.updatePost = functions.firestore.document('posts/{postID}').onUpdate((ch
         })
 
     } else {
-        
+
         var metaObject = {
             numLikes: data.numLikes != null ? data.numLikes : 0,
             numReplies: data.numReplies != null ? data.numReplies : 0,
             numCommenters: data.numCommenters != null ? data.numCommenters : 0,
             reports: data.reports != null ? data.reports : 0,
-            score: 0
+            score: data.score != null ? data.score : 0
         };
         metaObject['objectID'] = postID;
-        console.log("UPDATE ALGOLIA! ", metaObject);
+
         const objects = [metaObject];
-        
+
         if (data.parent != null && data.parent != 'NONE') {
             return commentsAdminIndex.partialUpdateObjects(objects, true);
         } else {
@@ -1893,7 +1882,6 @@ function markQueryBatchForRemoval(db, query, batchSize, resolve, reject) {
             if (snapshot.size == 0) {
                 return 0;
             }
-
 
             const deletedPostObject = {
                 "status": "removed",

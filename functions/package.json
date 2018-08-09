@@ -19,7 +19,8 @@
         "keyword-extractor": "*",
         "node-geocoder": "*",
         "promise-reflect": "*",
-        "swearjar": "^0.2.0"
+        "swearjar": "^0.2.0",
+        "decay": "*"
     },
     "private": true
 }
