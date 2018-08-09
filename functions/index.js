@@ -85,8 +85,13 @@ exports.deleteAllUsers = functions.https.onRequest((req, res) => {
 });
 
 exports.cleanUp = functions.https.onRequest((req, res) => {
+
+    var now = new Date();
+    var tenMinutesAgo = Date.now() - 3 * 60 * 1000
     var batchSize = 20;
-    var removedPostsRef = firestore.collection('posts').where('status', '==', 'removed');
+    var removedPostsRef = firestore.collection('posts')
+        .where('removedAt', '<', tenMinutesAgo)
+        .orderBy('removedAt');
     var query = removedPostsRef.limit(batchSize);
     return new Promise((resolve, reject) => {
         deleteQueryBatch(firestore, query, batchSize, resolve, reject);
@@ -95,6 +100,7 @@ exports.cleanUp = functions.https.onRequest((req, res) => {
             success: true
         });
     }).catch(e => {
+        console.log("Error: ", e);
         return res.send({
             success: false,
             error: e
@@ -528,6 +534,7 @@ exports.addComment = functions.https.onCall((data, context) => {
 
         if (replyTo) {
             updateObject[`posts/replies/${replyTo}/${replyID}`] = true;
+            updateObject[`posts/commenters/${replyTo}/${replyID}`] = true;
             //updateObject[`tasks/posts/${replyTo}/replies`] = true;
             //updateObject[`tasks/posts/${replyTo}/commenters`] = true;
         }
@@ -1279,132 +1286,45 @@ exports.timeoutsUpdater = functions.https.onRequest((req, res) => {
 });
 
 exports.tasksWorker = functions.https.onRequest((req, res) => {
-
-    const getTasks = database.ref(`tasks/posts`).once('value');
-    var updatedPostKeys = [];
-    var updatedPosts = {};
-
-    var votesTasks = [];
-    var repliesTasks = [];
-    var reportsTasks = [];
-
-    var deleteTasks = [];
-
-    return getTasks.then(function (snapshot) {
-        snapshot.forEach(function (post) {
-            const isVotesTask = post.val().likes;
-            const isRepliesTask = post.val().replies;
-            const isDeleteTask = post.val().delete;
-            const isReportTask = post.val().reports;
-            const isCommentersTask = post.val().commenters;
-
-            if (isDeleteTask) {
-                deleteTasks.push(post.key);
+    const getUpdatedPosts = database.ref(`posts/meta`).orderByChild('needsUpdate').equalTo(true).once('value');
+    var postIDs = [];
+    return getUpdatedPosts.then(results => {
+        var promises = [];
+        results.forEach(function (post) {
+            const postID = post.key;
+            const data = post.val();
+            postIDs.push(postID);
+            if (data.needsRemoval != null) {
+                // Delete all post meta
+                var updateObject = {};
+                updateObject[`posts/commenters/${postID}`] = null;
+                updateObject[`posts/likes/${postID}`] = null;
+                updateObject[`posts/replies/${postID}`] = null;
+                updateObject[`posts/reports/${postID}`] = null;
+                updateObject[`posts/subscribers/${postID}`] = null;
+                updateObject[`posts/meta/needsRemoval/${postID}`] = null;
+                updateObject[`posts/meta/${postID}/removedAt`] = Date.now();
+                promises.push(database.ref().update(updateObject));
             } else {
-                if (isVotesTask) {
-                    const getPostVotes = database.ref(`posts/likes/${post.key}`).once('value');
-                    votesTasks.push(getPostVotes);
-                }
-                if (isRepliesTask) {
-                    const getPostReplies = database.ref(`posts/replies/${post.key}`).once('value');
-                    repliesTasks.push(getPostReplies);
-                }
+                const postRef = firestore.collection('posts').doc(postID);
+                const metaObject = {
+                    numLikes: data.numLikes != null ? data.numLikes : 0,
+                    numReplies: data.numReplies != null ? data.numReplies : 0,
+                    numCommenters: data.numCommenters != null ? data.numCommenters : 0,
+                    reports: data.reports != null ? data.reports : 0,
+                    score: 0
+                };
 
-                if (isCommentersTask) {
-
-                }
-
-                if (isReportTask) {
-                    const getPostReports = database.ref(`posts/reports/${post.key}`).once('value');
-                    reportsTasks.push(getPostReports);
-                }
+                promises.push(postRef.update(metaObject));
             }
         });
-
-        var tasks = votesTasks.concat(repliesTasks).concat(reportsTasks);
-
-        return Promise.all(tasks.map(promiseReflect));
-    }).then(results => {
-
+        return Promise.all(promises);
+    }).then(() => {
         var updateObject = {};
-        var updatePromises = [];
-
-        for (var i = 0; i < votesTasks.length; i++) {
-
-            const userLikes = results[i]["data"];
-            if (userLikes) {
-                const postID = userLikes.key;
-
-                if (userLikes.numChildren() == 0) {
-                    updateObject[`posts/meta/${postID}/likes`] = null;
-                    updateObject[`posts/meta/${postID}/numLikes`] = 0;
-                } else {
-                    var likes = 0;
-                    userLikes.forEach(function (userLike) {
-                        const like = userLike.val();
-                        if (like) {
-                            likes += 1;
-                        }
-                    });
-
-                    updateObject[`posts/meta/${postID}/numLikes`] = likes;
-                }
-
-                updateObject[`tasks/posts/${postID}`] = null;
-            }
+        for (var i = 0; i < postIDs.length; i++) {
+            updateObject[`posts/meta/${postIDs[i]}/needsUpdate`] = null;
         }
-
-        for (var j = votesTasks.length; j < repliesTasks.length + votesTasks.length; j++) {
-
-            const data = results[j]["data"];
-            if (data) {
-                const postID = data.key;
-                updateObject[`posts/meta/${postID}/replies`] = data.numChildren();
-                updateObject[`tasks/posts/${postID}`] = null;
-            }
-        }
-
-        for (var r = votesTasks.length + repliesTasks.length; r < repliesTasks.length + votesTasks.length + reportsTasks.length; r++) {
-
-            const data = results[r]["data"];
-            if (data) {
-                var inappropriate = 0;
-                var spam = 0
-                data.forEach(function (report) {
-                    const type = report.val().type;
-                    switch (type) {
-                        case "inappropriate":
-                            inappropriate += 1
-                            break
-                        case "spam":
-                            spam += 1
-                            break
-                        default:
-                            break
-                    }
-                });
-                const postID = data.key;
-                updateObject[`posts/meta/${postID}/reports`] = {
-                    "inappropriate": inappropriate,
-                    "spam": spam
-                };
-                updateObject[`tasks/posts/${postID}`] = null;
-            }
-        }
-
-        for (var k = 0; k < deleteTasks.length; k++) {
-            const postID = deleteTasks[k];
-            updateObject[`posts/meta/${postID}`] = null;
-            updateObject[`posts/likes/${postID}`] = null;
-            updateObject[`posts/replies/${postID}`] = null;
-            updateObject[`posts/commenters/${postID}`] = null;
-            updateObject[`tasks/posts/${postID}`] = null;
-        }
-
-        const update = database.ref().update(updateObject);
-        updatePromises.push(update);
-
-
+        return database.ref().update(updateObject);
     }).then(() => {
         return res.send({
             success: true
@@ -1541,7 +1461,7 @@ exports.updatePostReplies = functions.database.ref('posts/replies/{postID}/{repl
             numReplies = newCount;
         }
         return numReplies;
-    }).then( () => {
+    }).then(() => {
         const setNeedsUpdate = database.ref(`posts/meta/${postID}/needsUpdate`).set(true);
         return setNeedsUpdate;
     });
@@ -1562,7 +1482,7 @@ exports.updatePostCommenters = functions.database.ref('posts/commenters/{postID}
             numCommenters = newCount;
         }
         return numCommenters;
-    }).then( () => {
+    }).then(() => {
         const setNeedsUpdate = database.ref(`posts/meta/${postID}/needsUpdate`).set(true);
         return setNeedsUpdate;
     });
@@ -1618,7 +1538,7 @@ exports.updatePostReports = functions.database.ref('posts/reports/{postID}/{uid}
             };
         }
         return reports;
-    }).then( () => {
+    }).then(() => {
         const setNeedsUpdate = database.ref(`posts/meta/${postID}/needsUpdate`).set(true);
         return setNeedsUpdate;
     });
@@ -1846,13 +1766,19 @@ exports.removePost = functions.https.onCall((data, context) => {
     });
 });
 
-exports.handlePostRemoval = functions.firestore.document('posts/{postID}').onUpdate((change, context) => {
+exports.decimatePost = functions.firestore.document('posts/{postID}').onDelete((change, context) => {
     const postID = context.params.postID;
-    const newValue = change.after.data();
+    const deletePostMeta = database.ref(`posts/meta/${postID}`).remove();
+    return deletePostMeta;
+});
+
+exports.updatePost = functions.firestore.document('posts/{postID}').onUpdate((change, context) => {
+    const postID = context.params.postID;
+    const data = change.after.data();
 
     const prevData = change.before.data();
 
-    if (newValue != null && newValue.status === 'removed') {
+    if (data != null && data.status === 'removed') {
 
         var uid;
         var batchSize = 20;
@@ -1874,10 +1800,6 @@ exports.handlePostRemoval = functions.firestore.document('posts/{postID}').onUpd
         }).then(() => {
             const deleteIndexObject = postsAdminIndex.deleteObject(postID);
             return deleteIndexObject;
-        }).then(() => {
-            var updateObject = {};
-            updateObject[`tasks/posts/${postID}/delete`] = true;
-            return database.ref().update(updateObject);
         }).then(() => {
             const getSubscribers = database.ref(`posts/subscribers/${postID}`).once('value');
             return getSubscribers;
@@ -1906,6 +1828,11 @@ exports.handlePostRemoval = functions.firestore.document('posts/{postID}').onUpd
             }
             return Promise.all(promises.map(promiseReflect));
         }).then(() => {
+            var updateObject = {};
+            updateObject[`posts/meta/${postID}/needsUpdate`] = true;
+            updateObject[`posts/meta/${postID}/needsRemoval`] = true;
+            return database.ref().update(updateObject);
+        }).then(() => {
 
             const repliesRef = firestore.collection('posts').where('status', '==', 'active').where('parent', '==', postID)
             const repliesQuery = repliesRef.orderBy('createdAt').limit(batchSize);
@@ -1927,7 +1854,23 @@ exports.handlePostRemoval = functions.firestore.document('posts/{postID}').onUpd
         })
 
     } else {
-        return Promise.resolve();
+        
+        var metaObject = {
+            numLikes: data.numLikes != null ? data.numLikes : 0,
+            numReplies: data.numReplies != null ? data.numReplies : 0,
+            numCommenters: data.numCommenters != null ? data.numCommenters : 0,
+            reports: data.reports != null ? data.reports : 0,
+            score: 0
+        };
+        metaObject['objectID'] = postID;
+        console.log("UPDATE ALGOLIA! ", metaObject);
+        const objects = [metaObject];
+        
+        if (data.parent != null && data.parent != 'NONE') {
+            return commentsAdminIndex.partialUpdateObjects(objects, true);
+        } else {
+            return postsAdminIndex.partialUpdateObjects(objects, true);
+        }
     }
 });
 
@@ -2011,63 +1954,6 @@ function deleteQueryBatch(db, query, batchSize, resolve, reject) {
         })
         .catch(reject);
 }
-
-exports.blockUser = functions.https.onCall((data, context) => {
-
-    // Authentication / user information is automatically added to the request.
-    const uid = context.auth.uid;
-
-    // Checking that the user is authenticated.
-    if (!context.auth) {
-        // Throwing an HttpsError so that the client gets the error details.
-        throw new functions.https.HttpsError('failed-precondition', 'The function must be called ' +
-            'while authenticated.');
-    }
-    const postID = data.postID;
-    const blockedID = data.blockedID;
-    const timestamp = data.timestamp;
-
-    const getAuthor = database.ref(`posts/meta/${postID}/author`).once('value');
-    return getAuthor.then(result => {
-        console.log("RESULT!: ", result);
-        if (result) {
-
-            const author = result.val();
-            if (author === uid) {
-                throw new functions.https.HttpsError('failed', 'You cannot block yourself.');
-            }
-
-            console.log("AUTHOR: ", author);
-            const userDoc = firestore.collection("users").doc(uid);
-            const docID = `${postID}:${blockedID}`;
-            const setBlockedID = userDoc.collection("blocked").doc(docID).set({
-                "postID": postID,
-                "blockedID": blockedID,
-                "timestamp": timestamp
-            });
-
-            const setPrivateBlockedID = userDoc.collection("blocked_private").doc(docID).set({
-                "postID": postID,
-                "uid": author,
-                "timestamp": timestamp
-            });
-
-            return Promise.all([setBlockedID, setPrivateBlockedID]);
-
-        } else {
-            throw new functions.https.HttpsError('failed', 'Blocked user not found');
-        }
-    }).then(() => {
-        return {
-            success: true
-        };
-    }).catch(error => {
-        console.log("ERROR: ", error);
-
-        throw new functions.https.HttpsError('failed', error);
-    })
-
-});
 
 function extractMentions(text) {
     const pattern = /\B@[a-z0-9_-]+/gi;
