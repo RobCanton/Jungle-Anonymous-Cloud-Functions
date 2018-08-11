@@ -120,7 +120,7 @@ exports.trendingTags = functions.https.onCall((data, context) => {
         throw new functions.https.HttpsError('failed-precondition', 'The function must be called ' +
             'while authenticated.');
     }
-    
+
     const getTrendingTags = database.ref(`trending/hashtags`).once('value');
     return getTrendingTags.then(snapshot => {
         var trendingData = snapshot.val();
@@ -132,11 +132,9 @@ exports.trendingTags = functions.https.onCall((data, context) => {
                 var post = posts[key];
                 post['isYou'] = post.uid === uid;
                 delete post.uid;
-                console.log(`${key}: ${util.inspect(post, false, null)}`);
                 postsArray.push(post);
             }
             trendingData[tag.key]['posts'] = postsArray;
-
         });
 
         return trendingData;
@@ -308,6 +306,7 @@ exports.addPost = functions.https.onCall((data, context) => {
     // Authentication / user information is automatically added to the request.
     const uid = context.auth.uid;
     const email = context.auth.token.email;
+    const email_verified = context.auth.token.email_verified;
 
     // Checking that the user is authenticated.
     if (!context.auth) {
@@ -316,76 +315,82 @@ exports.addPost = functions.https.onCall((data, context) => {
             'while authenticated.');
     }
 
-    if (email == null) {
+    if (email == null || !email_verified) {
         throw new functions.https.HttpsError('failed-precondition', 'The function must be called ' +
             'while authenticated.');
     }
 
     const createdAt = Date.now();
 
+
     var postObject;
     var anonObject;
+    var profileObject;
     var lat;
     var lon;
     var region;
     var location;
 
     const postID = data.postID;
+    const text = data.text;
+    const attachments = data.attachments;
+    const isAnonymous = data.isAnonymous;
+    const gradient = anonymizer.matchingGradient();
 
     const thumbnailJPGInputFilePath = `/userPosts/${uid}/${postID}/thumbnail.jpg`;
     const thumbnailJPGOutputFilePath = `publicPosts/${postID}/thumbnail.jpg`;
 
-    var anonymizeFiles = [Promise.resolve()];
+    var getUserProfile = Promise.resolve(null);
 
-    if (data.attachments != null) {
-        if (data.attachments.video != null) {
+    if (!isAnonymous) {
+        getUserProfile = database.ref(`users/profile/${uid}`).once('value');
 
-            const videoInputFilePath = `/userPosts/${uid}/${postID}/video.mp4`;
-            const videoOutputFilePath = `publicPosts/${postID}/video.mp4`;
+    }
 
-            const thumbnailInputFilePath = `/userPosts/${uid}/${postID}/thumbnail.gif`;
-            const thumbnailOutputFilePath = `publicPosts/${postID}/thumbnail.gif`;
 
-            anonymizeFiles = [
+    return getUserProfile.then(_profile => {
+
+        if (!isAnonymous) {
+            if (_profile == null) {
+                return Promise.reject("Invalid user profile");
+            } else {
+                profileObject = _profile.val();
+            }
+
+        }
+
+        var anonymizeFiles = [Promise.resolve()];
+
+        if (data.attachments != null) {
+            if (data.attachments.video != null) {
+
+                const videoInputFilePath = `/userPosts/${uid}/${postID}/video.mp4`;
+                const videoOutputFilePath = `publicPosts/${postID}/video.mp4`;
+
+                const thumbnailInputFilePath = `/userPosts/${uid}/${postID}/thumbnail.gif`;
+                const thumbnailOutputFilePath = `publicPosts/${postID}/thumbnail.gif`;
+
+                anonymizeFiles = [
                 anonymizer.anonymizeFile(videoInputFilePath, videoOutputFilePath),
                 anonymizer.anonymizeFile(thumbnailInputFilePath, thumbnailOutputFilePath),
                 anonymizer.anonymizeFile(thumbnailJPGInputFilePath, thumbnailJPGOutputFilePath)
             ];
 
-        } else if (data.attachments.image != null) {
-            const imageInputFilePath = `/userPosts/${uid}/${postID}/image.jpg`;
-            const imageOutputFilePath = `publicPosts/${postID}/image.jpg`;
+            } else if (data.attachments.image != null) {
+                const imageInputFilePath = `/userPosts/${uid}/${postID}/image.jpg`;
+                const imageOutputFilePath = `publicPosts/${postID}/image.jpg`;
 
-            anonymizeFiles = [
+                anonymizeFiles = [
                 anonymizer.anonymizeFile(imageInputFilePath, imageOutputFilePath),
                 anonymizer.anonymizeFile(thumbnailJPGInputFilePath, thumbnailJPGOutputFilePath)
             ];
 
+            }
         }
-    }
-
-
-    return Promise.all(anonymizeFiles).then(() => {
-        const text = data.text;
-        const attachments = data.attachments;
-
-        const adjective = anonymizer.randomAdjective();
-        const animal = anonymizer.randomAnimal();
-        const color = anonymizer.randomColor();
-        const gradient = anonymizer.matchingGradient();
-        const anonKey = `${adjective}${animal}`;
-        location = data.location;
-
-
-        anonObject = {
-            "key": anonKey,
-            "adjective": adjective,
-            "animal": animal,
-            "color": color
-        };
+        return Promise.all(anonymizeFiles)
+    }).then(() => {
 
         postObject = {
-            "anon": anonObject,
             "text": text,
             "textClean": swearjar.censor(text),
             "createdAt": createdAt,
@@ -397,6 +402,30 @@ exports.addPost = functions.https.onCall((data, context) => {
             "replyTo": "NONE",
             "gradient": gradient
         };
+
+        if (isAnonymous) {
+
+            const adjective = anonymizer.randomAdjective();
+            const animal = anonymizer.randomAnimal();
+            const color = anonymizer.randomColor();
+
+            const anonKey = `${adjective}${animal}`;
+            location = data.location;
+
+
+            anonObject = {
+                "key": anonKey,
+                "adjective": adjective,
+                "animal": animal,
+                "color": color
+            };
+
+            postObject['anon'] = anonObject;
+
+        } else {
+            postObject['author'] = uid;
+            postObject['profile'] = profileObject;
+        }
 
         if (attachments) {
             postObject["attachments"] = attachments;
@@ -415,13 +444,6 @@ exports.addPost = functions.https.onCall((data, context) => {
         var batch = firestore.batch();
 
         batch.set(postRef, postObject);
-
-
-        var lexiconObject = anonObject;
-        lexiconObject["uid"] = uid;
-
-        var lexiconRef = postRef.collection('lexicon').doc(uid);
-        batch.set(lexiconRef, lexiconObject);
 
         var userObject = {
             lastPostedAt: createdAt,
@@ -451,19 +473,21 @@ exports.addPost = functions.https.onCall((data, context) => {
 
     }).then(() => {
 
-        var lexicon = {};
-        lexicon[anonObject.key] = uid;
-
         var metaObject = {
             author: uid,
             status: 'active',
-            createdAt: createdAt,
-            lexicon: lexicon
+            createdAt: createdAt
         };
 
         var updateObject = {};
         updateObject[`posts/subscribers/${postID}/${uid}`] = true
         updateObject[`posts/meta/${postID}`] = metaObject;
+
+        if (isAnonymous) {
+            updateObject[`posts/lexicon/${postID}/${uid}`] = anonObject;
+        } else {
+            updateObject[`posts/lexicon/${postID}/${uid}`] = profileObject;
+        }
 
         const setPostMeta = database.ref().update(updateObject);
         return setPostMeta;
@@ -502,6 +526,7 @@ exports.addComment = functions.https.onCall((data, context) => {
 
     const postID = data.postID;
     const text = data.text;
+    const isAnonymous = data.isAnonymous;
 
     const textClean = swearjar.censor(text);
     const replyTo = data.replyTo;
@@ -511,11 +536,11 @@ exports.addComment = functions.https.onCall((data, context) => {
     var anonObject = {};
 
     var commentObject = {};
-    const getAnonKey = parentPostRef.collection('lexicon').doc(uid);
 
     var replyID;
     var postAuthor;
     var lexicon = {};
+    var lexiconEntry = null;
 
     var createdAt = Date.now();
 
@@ -525,19 +550,15 @@ exports.addComment = functions.https.onCall((data, context) => {
             const postMeta = result.val()
             postAuthor = postMeta.author;
 
-            if (postMeta.lexicon) {
-                lexicon = postMeta.lexicon;
-            }
-            return anonymizer.getUserAnonymousKey(uid, postID);
+            return anonymizer.getUserLexiconEntry(uid, postID, isAnonymous);
 
         } else {
             throw new functions.https.HttpsError('failed-precondition', 'Unable to add comment.');
         }
-    }).then(_anonObject => {
-        anonObject = _anonObject;
+    }).then(_lexiconEntry => {
+        lexiconEntry = _lexiconEntry
 
         commentObject = {
-            "anon": anonObject,
             "text": text,
             "textClean": textClean,
             "createdAt": createdAt,
@@ -549,6 +570,26 @@ exports.addComment = functions.https.onCall((data, context) => {
             "score": 0
         };
 
+        if (lexiconEntry != null) {
+            if (isAnonymous) {
+                if (lexiconEntry.key != null && lexiconEntry.adjective != null &&
+                    lexiconEntry.animal != null && lexiconEntry.color != null) {
+                    commentObject['anon'] = lexiconEntry;
+                } else {
+                    return Promise.reject('Invalid anon object');
+                }
+            } else {
+                if (lexiconEntry.username != null) {
+                    commentObject['author'] = uid;
+                    commentObject['profile'] = lexiconEntry;
+                } else {
+                    return Promise.reject('Invalid profile object');
+                }
+            }
+        } else {
+            return Promise.reject('Invalid lexicon entry');
+        }
+
         if (replyTo) {
             commentObject["replyTo"] = replyTo;
         } else {
@@ -556,7 +597,6 @@ exports.addComment = functions.https.onCall((data, context) => {
         }
 
         var addComment = firestore.collection('posts').add(commentObject);
-
         return addComment;
     }).then(ref => {
 
@@ -569,15 +609,11 @@ exports.addComment = functions.https.onCall((data, context) => {
 
         updateObject[`posts/replies/${postID}/${replyID}`] = true;
         updateObject[`posts/commenters/${postID}/${uid}`] = true;
-        //updateObject[`tasks/posts/${postID}/replies`] = true;
-        //updateObject[`tasks/posts/${postID}/commenters`] = true;
         updateObject[`posts/subscribers/${postID}/${uid}`] = true;
 
         if (replyTo) {
             updateObject[`posts/replies/${replyTo}/${replyID}`] = true;
             updateObject[`posts/commenters/${replyTo}/${replyID}`] = true;
-            //updateObject[`tasks/posts/${replyTo}/replies`] = true;
-            //updateObject[`tasks/posts/${replyTo}/commenters`] = true;
         }
 
         const update = database.ref().update(updateObject);
@@ -594,49 +630,59 @@ exports.addComment = functions.https.onCall((data, context) => {
         const getSubscribers = database.ref(`posts/subscribers/${postID}`).once('value');
         return getSubscribers;
     }).then(_subscribers => {
-        var subscribers = _subscribers.val();
-        const mentions = extractMentions(text);
-        var mentionedUIDs = {};
-
-        for (var i = 0; i < mentions.length; i++) {
-            const anonKey = mentions[i].substring(1);
-            const uid = lexicon[anonKey];
-            mentionedUIDs[uid] = true;
-        }
-
-        var notificationPromises = [];
-        for (var subscriberID in subscribers) {
-            if (!subscribers[subscriberID]) {
-                //console.log("NOT SUBSCRIBED -> IGNORE: ", subscriberID);
-            } else if (subscriberID === uid || subscriberID == uid || !subscribers[subscriberID]) {
-                //console.log("SUBSCRIBER IS SENDER -> IGNORE: ", subscriberID);
-            } else {
-                //console.log("SEND TO SUBSCRIBER: ", subscriberID);
-
-                var notificationObject = {
-                    anon: anonObject,
-                    timestamp: Date.now(),
-                    type: "POST_REPLY",
-                    postID: postID,
-                    replyID: replyID,
-                    mention: subscriberID in mentionedUIDs,
-                    seen: false,
-                    text: trim(text),
-                    name: anonObject.key
-                };
-
-                if (replyTo) {
-                    notificationObject["replyTo"] = replyTo;
-                }
-
-                const notificationsRef = database.ref(`users/notifications/${subscriberID}`).push();
-                const setNotification = notificationsRef.set(notificationObject);
-
-                notificationPromises.push(setNotification);
-            }
-        }
-
-        return Promise.all(notificationPromises.map(promiseReflect));
+        return Promise.resolve();
+        //        var subscribers = _subscribers.val();
+        //        const mentions = extractMentions(text);
+        //        var mentionedUIDs = {};
+        //
+        //        for (var i = 0; i < mentions.length; i++) {
+        //            const anonKey = mentions[i].substring(1);
+        //            const uid = lexicon[anonKey];
+        //            mentionedUIDs[uid] = true;
+        //        }
+        //
+        //        var notificationPromises = [];
+        //        for (var subscriberID in subscribers) {
+        //            if (!subscribers[subscriberID]) {
+        //                //console.log("NOT SUBSCRIBED -> IGNORE: ", subscriberID);
+        //            } else if (subscriberID === uid || subscriberID == uid || !subscribers[subscriberID]) {
+        //                //console.log("SUBSCRIBER IS SENDER -> IGNORE: ", subscriberID);
+        //            } else {
+        //                //console.log("SEND TO SUBSCRIBER: ", subscriberID);
+        //
+        //                var notificationObject = {
+        //                    timestamp: Date.now(),
+        //                    type: "POST_REPLY",
+        //                    postID: postID,
+        //                    replyID: replyID,
+        //                    mention: subscriberID in mentionedUIDs,
+        //                    seen: false,
+        //                    text: trim(text)
+        //                };
+        //                
+        //                if (isAnonymous) {
+        //                    if (anonObject != null) {
+        //                        notificationObject['anon'] = anonObject;
+        //                        notificationObject['name'] = anonObject.key
+        //                    } else {
+        //                        return Promise.reject('Invalid anon object');
+        //                    }
+        //                } else {
+        //                    notificationObject['author'] = uid;
+        //                }
+        //
+        //                if (replyTo) {
+        //                    notificationObject["replyTo"] = replyTo;
+        //                }
+        //
+        //                const notificationsRef = database.ref(`users/notifications/${subscriberID}`).push();
+        //                const setNotification = notificationsRef.set(notificationObject);
+        //
+        //                notificationPromises.push(setNotification);
+        //            }
+        //        }
+        //
+        //        return Promise.all(notificationPromises.map(promiseReflect));
 
     }).then(ref => {
 
@@ -659,14 +705,20 @@ function populatePosts(_posts, uid) {
 
         for (var i = 0; i < posts.length; i++) {
             const post = posts[i];
-            const getPostAuthor = database.ref(`posts/meta/${post.id}/author`).once('value');
-            promises.push(getPostAuthor);
+            if (post.profile != null) {
+                promises.push(null);
+            } else {
+                const getPostAuthor = database.ref(`posts/meta/${post.id}/author`).once('value');
+                promises.push(getPostAuthor);
+            }
+
         }
         return Promise.all(promises).then(results => {
             for (var i = 0; i < results.length; i++) {
                 const result = results[i];
-                const isYou = result.val() === uid;
-                posts[i]['isYou'] = isYou;
+                if (result != null) {
+                    posts[i]['isYou'] = result.val() === uid;
+                }
             }
             return resolve(posts);
         }).catch(e => {
@@ -714,20 +766,26 @@ function fetchCommentsAndPopulate(postID, uid, query) {
     return new Promise((resolve, reject) => {
         var comments = [];
 
-        const getMyAnon = firestore.collection('posts').doc(postID).collection('lexicon').doc(uid).get();
-        var anonKey = "";
-        getMyAnon.then(anon => {
-            if (anon.data()) {
-                anonKey = anon.data().key;
+        const getMyLexiconEntry = database.ref(`posts/lexicon/${postID}/${uid}`).once('value');
+        var lexiconKey = "";
+
+        getMyLexiconEntry.then(entry => {
+            if (entry.exists()) {
+                if (entry.val().key) {
+                    lexiconKey = entry.val().key;
+                }
             }
             return query;
         }).then(snapshot => {
             var promises = [];
             snapshot.forEach(function (comment) {
                 var commentData = comment.data();
-                var commentAnonKey = commentData.anon.key;
                 commentData['id'] = comment.id;
-                commentData['isYou'] = commentAnonKey === anonKey;
+
+                if (commentData.anon != null) {
+                    commentData['isYou'] = commentData.anon.key === lexiconKey;
+                }
+
                 comments.push(commentData);
                 const getSubReplies = firestore.collection('posts')
                     .where('replyTo', '==', comment.id)
@@ -744,20 +802,60 @@ function fetchCommentsAndPopulate(postID, uid, query) {
                 var replies = [];
                 subReplies.forEach(function (subReply) {
                     var subReplyData = subReply.data();
-                    var subReplyAnonKey = subReplyData.anon.key;
+
                     subReplyData['id'] = subReply.id;
-                    subReplyData['isYou'] = subReplyAnonKey === anonKey;
+
+                    if (subReplyData.anon != null) {
+                        subReplyData['isYou'] = subReplyData.anon.key === lexiconKey;
+                    }
+
                     replies.push(subReplyData);
 
                 });
                 comments[i]['replies'] = replies;
             }
+
+
             return resolve(comments);
         }).catch(e => {
             return reject(e);
         });
     });
 }
+
+exports.createUserProfile = functions.https.onCall((data, context) => {
+
+    const uid = context.auth.uid;
+
+    // Checking that the user is authenticated.
+    if (!context.auth) {
+        // Throwing an HttpsError so that the client gets the error details.
+        throw new functions.https.HttpsError('failed-precondition', 'The function must be called ' +
+            'while authenticated.');
+    }
+
+    const userRef = database.ref(`users/profile/${uid}`)
+    const profile = {
+        avatar: {
+            high: data.avatar.high,
+            low: data.avatar.low
+        },
+        username: data.username
+    };
+
+    return userRef.set(profile).then(() => {
+        return {
+            success: true,
+            profile: profile
+        }
+    }).catch(e => {
+        console.log("Error: ", e);
+        return {
+            success: false
+        }
+    })
+
+});
 
 exports.userAccount = functions.https.onCall((data, context) => {
     const uid = context.auth.uid;
@@ -785,6 +883,7 @@ exports.userAccount = functions.https.onCall((data, context) => {
         var timeoutObject = {
             canPost: true
         };
+        var settings = {};
         const getUserData = firestore.collection('users').doc(uid).get();
         return getUserData.then(snapshot => {
             isReturningUser = snapshot.exists
@@ -814,11 +913,16 @@ exports.userAccount = functions.https.onCall((data, context) => {
             const getUserSettings = database.ref(`users/settings/${uid}`).once('value');
             return getUserSettings;
         }).then(snapshot => {
+            settings = snapshot.val() != null ? snapshot.val() : {};
+            const getUserProfile = database.ref(`users/profile/${uid}`).once('value');
+            return getUserProfile;
+        }).then(snapshot => {
             return {
                 success: true,
                 type: "email",
-                settings: snapshot.val(),
-                timeout: timeoutObject
+                settings: settings,
+                timeout: timeoutObject,
+                profile: snapshot.val() != null ? snapshot.val() : {}
             };
         }).catch(e => {
             console.log("Error: ", e);
@@ -1359,6 +1463,7 @@ exports.tasksWorker = functions.https.onRequest((req, res) => {
                 // Delete all post meta
                 var updateObject = {};
                 updateObject[`posts/commenters/${postID}`] = null;
+                updateObject[`posts/lexicon /${postID}`] = null;
                 updateObject[`posts/likes/${postID}`] = null;
                 updateObject[`posts/replies/${postID}`] = null;
                 updateObject[`posts/reports/${postID}`] = null;
@@ -1400,39 +1505,233 @@ exports.tasksWorker = functions.https.onRequest((req, res) => {
     })
 });
 
-exports.postUpdateLikes = functions.database.ref('posts/likes/{postID}/{uid}').onWrite((change, context) => {
-    const postID = context.params.postID;
-    const uid = context.params.uid;
+exports.setPostLike = functions.https.onCall((data, context) => {
 
-    const prevData = change.before.val();
-    const data = change.after.val();
-    var newCount = 0;
-    if (data != null) {
-        newCount = data ? 1 : -1;
-    } else if (prevData != null) {
-        newCount = prevData ? -1 : 0;
+    const postID = data.postID;
+    const liked = data.liked;
+    const isAnon = data.isAnon;
+    // Authentication / user information is automatically added to the request.
+    const uid = context.auth.uid;
+
+
+
+    // Checking that the user is authenticated.
+    if (!context.auth) {
+        // Throwing an HttpsError so that the client gets the error details.
+        throw new functions.https.HttpsError('failed-precondition', 'The function must be called ' +
+            'while authenticated.');
     }
 
+    let likeRef = database.ref(`posts/likes/${postID}/${uid}`);
+    var firstTime = false;
+    var lexiconEntry = null;
+    
+    var notificationsRef;
+    var notificationObject;
+    
+    return likeRef.once('value').then(snapshot => {
+        firstTime = !snapshot.exists();
 
-    var promise = Promise.resolve();
+        return anonymizer.getUserLexiconEntry(uid, postID, isAnon);
 
-    if (newCount != 0) {
-        const postLikesRef = database.ref(`posts/meta/${postID}/numLikes`);
-        promise = postLikesRef.transaction(function (numLikes) {
-            if (numLikes) {
-                numLikes += newCount;
-            } else {
-                numLikes = newCount;
+    }).then(_lexiconEntry => {
+        lexiconEntry = _lexiconEntry;
+        if (lexiconEntry == null) {
+            return Promise.reject('Invalid lexicon entry');
+        }
+        return likeRef.set(liked);
+
+    }).then(() => {
+        if (!firstTime) {
+            return Promise.resolve();
+        }
+
+        let promises = [
+            firestore.collection('posts').doc(postID).get(),
+            database.ref(`posts/meta/${postID}`).once('value'),
+            database.ref(`posts/subscribers/${postID}`).once('value')
+        ];
+
+        return Promise.all(promises);
+
+    }).then(results => {
+
+        if (!firstTime) {
+            return Promise.resolve();
+        }
+
+        const postData = results[0].data();
+        const postMeta = results[1].val();
+        const subscribers = results[2].val();
+
+        const author = postMeta.author;
+
+        if (author === uid) {
+            return Promise.resolve();
+        }
+        if (subscribers != null) {
+            // Author is not subscribed to their own post
+            if (!subscribers.hasOwnProperty(author)) {
+                return Promise.resolve();
             }
-            return numLikes;
-        });
-    }
+        } else {
+            // Post has no subscribers
+            return Promise.resolve();
+        }
 
-    return promise.then(() => {
-        const setNeedsUpdate = database.ref(`posts/meta/${postID}/needsUpdate`).set(true);
-        return setNeedsUpdate;
+        var numLikes = 0;
+        if (postMeta.numLikes) {
+            numLikes = postMeta.numLikes;
+        }
+
+        const notificationID = `POST_LIKES:${postID}`
+        notificationObject = {
+            timestamp: Date.now(),
+            type: "POST_LIKES",
+            numLikes: numLikes + 1,
+            postID: postID,
+            seen: false,
+            text: trim(postData.textClean)
+        };
+
+        if (lexiconEntry.key != null && lexiconEntry.adjective != null &&
+            lexiconEntry.animal != null && lexiconEntry.color != null) {
+            notificationObject['anon'] = lexiconEntry;
+        } else if (lexiconEntry.username != null) {
+            notificationObject['profile'] = lexiconEntry;
+        } else {
+            return Promise.reject('Invalid lexicon entry');
+        }
+
+        notificationsRef = database.ref(`users/notifications/${author}/${notificationID}`);
+        return notificationsRef.remove();
+    }).then(() => {
+        if (!firstTime) {
+            return Promise.resolve();
+        }
+        return notificationsRef.set(notificationObject);
+    }).then( () => {
+        return { success: true };
+    }).catch(e => {
+        console.log("Error: ", e)
+        return { success: false };
     });
+
 });
+
+//exports.postUpdateLikes = functions.database.ref('posts/likes/{postID}/{uid}').onWrite((change, context) => {
+//    const postID = context.params.postID;
+//    const uid = context.params.uid;
+//
+//    const prevData = change.before.val();
+//    const data = change.after.val();
+//    var newCount = 0;
+//    if (data != null) {
+//        newCount = data ? 1 : -1;
+//    } else if (prevData != null) {
+//        newCount = prevData ? -1 : 0;
+//    }
+//
+//
+//    var promise = Promise.resolve();
+//
+//    if (newCount != 0) {
+//        const postLikesRef = database.ref(`posts/meta/${postID}/numLikes`);
+//        promise = postLikesRef.transaction(function (numLikes) {
+//            if (numLikes) {
+//                numLikes += newCount;
+//            } else {
+//                numLikes = newCount;
+//            }
+//            return numLikes;
+//        });
+//    }
+//
+//    return promise.then(() => {
+//        const setNeedsUpdate = database.ref(`posts/meta/${postID}/needsUpdate`).set(true);
+//        return setNeedsUpdate;
+//    }).then(() => {
+//        if (prevData != null) {
+//            return Promise.resolve();
+//        }
+//        const promises = [
+//            firestore.collection('posts').doc(postID).get(),
+//            database.ref(`posts/meta/${postID}`).once('value'),
+//            database.ref(`posts/subscribers/${postID}`).once('value'),
+//            anonymizer.getUserLexiconEntry(uid, postID)
+//        ];
+//        return Promise.all(promises);
+//
+//    }).then(results => {
+//        if (prevData != null) {
+//            return Promise.resolve();
+//        }
+//
+//        const postData = results[0].data();
+//        const postMeta = results[1].val();
+//        const subscribers = results[2].val();
+//        const lexiconEntry = results[3];
+//
+//        console.log(`LEXICON ENTRY: ${lexiconEntry}`);
+//
+//
+//        if (postData == null ||
+//            postMeta == null ||
+//            lexiconEntry == null) {
+//            return Promise.resolve();
+//        }
+//
+//        const author = postMeta.author;
+//
+//        if (author === uid) {
+//            return Promise.resolve();
+//        }
+//        if (subscribers != null) {
+//            // Author is not subscribed to their own post
+//            if (!subscribers.hasOwnProperty(author)) {
+//                return Promise.resolve();
+//            }
+//        } else {
+//            // Post has no subscribers
+//            return Promise.resolve();
+//        }
+//
+//        var numLikes = 0;
+//        if (postMeta.numLikes) {
+//            numLikes = postMeta.numLikes;
+//        }
+//
+//        const notificationID = `POST_LIKES:${postID}`
+//        var notificationObject = {
+//            timestamp: Date.now(),
+//            type: "POST_LIKES",
+//            numLikes: numLikes + 1,
+//            postID: postID,
+//            seen: false,
+//            text: trim(postData.textClean)
+//        };
+//
+//        if (lexiconEntry.key != null && lexiconEntry.adjective != null &&
+//            lexiconEntry.animal != null && lexiconEntry.color != null) {
+//            notificationObject['anon'] = lexiconEntry;
+//        } else if (lexiconEntry.username != null) {
+//            notificationObject['profile'] = lexiconEntry;
+//        } else {
+//            return Promise.reject('Invalid lexicon entry');
+//        }
+//
+//        const notificationsRef = database.ref(`users/notifications/${author}/${notificationID}`);
+//
+//        return notificationsRef.set(null).then(() => {
+//            return notificationsRef.set(notificationObject);
+//        }).catch(e => {
+//            return notificationsRef.set(notificationObject);
+//        });
+//    }).catch(e => {
+//        console.log("Error: ", e);
+//        return Promise.reject(e);
+//    })
+//});
 
 exports.postUpdateReplies = functions.database.ref('posts/replies/{postID}/{replyID}').onWrite((change, context) => {
     const postID = context.params.postID;
@@ -1829,12 +2128,6 @@ exports.postUpdate = functions.firestore.document('posts/{postID}').onUpdate((ch
                 markQueryBatchForRemoval(firestore, repliesQuery, batchSize, resolve, reject);
             });
 
-        }).then(() => {
-            var lexiconRef = firestore.collection('posts').doc(postID).collection('lexicon');
-            var query = lexiconRef.orderBy('key').limit(batchSize);
-            return new Promise((resolve, reject) => {
-                deleteQueryBatch(firestore, query, batchSize, resolve, reject);
-            });
         }).then(() => {
             return Promise.resolve();
         }).catch(e => {

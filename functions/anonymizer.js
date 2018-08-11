@@ -33,37 +33,50 @@ exports.anonymizeFile = function (inputFilePath, outputFilePath) {
     });
 };
 
-exports.getUserAnonymousKey = function (uid, postID) {
+exports.getUserLexiconEntry = function (uid, postID, isAnon) {
     return new Promise((resolve, reject) => {
-
-        const parentPostRef = firestore.collection('posts').doc(postID);
-        const lexiconRef = parentPostRef.collection('lexicon').doc(uid);
-        const getAnonKey = lexiconRef.get();
-        return getAnonKey.then(snapshot => {
-            if (snapshot.exists) {
-
-                console.log(`ANON KEY ALREADY EXISTS!: ${snapshot.data()}`);
-                return Promise.resolve(snapshot.data());
-
+        const getLexiconEntry = database.ref(`posts/lexicon/${postID}/${uid}`).once('value');
+        return getLexiconEntry.then(snapshot => {
+            if (snapshot.exists()) {
+                return Promise.resolve(snapshot.val());
             } else {
-                console.log(`GENERATE ANONYMOUS KEY`);
-                return generateAnonymousKeyForPost(uid, postID, {});
+                if (isAnon) {
+                    return generateAnonymousKeyForPost(uid, postID, {});
+                } else {
+                    return setUserAuthorLexiconEntry(uid, postID);
+                }
             }
         }).then(result => {
             return resolve(result);
         }).catch(error => {
             return reject(`ERROR: ${error}`);
-        })
+        });
     });
 }
 
-function isAnonKeyAvailable(key, uid, postID) {
-    return new Promise(resolve => {
-        const postRef = firestore.collection("posts").doc(postID);
-        const getEntry = postRef.collection("lexicon").where("key", "==", anonKey).get();
-        return getEntry.then(snapshot => {
-            resolve(snapshot.isEmpty);
+function setUserAuthorLexiconEntry(uid, postID) {
+    return new Promise((resolve, reject) => {
+        var profile;
+        const getUserProfile = database.ref(`users/profile/${uid}`).once('value');
+        return getUserProfile.then(_profile => {
+            if (_profile.exists()) {
+                profile = _profile.val();
+                const setLexiconEntry = database.ref(`posts/lexicon/${postID}/${uid}`).set(profile);
+                return setLexiconEntry;
+            } else {
+                return Promise.reject('No user profile found');
+            }
+        }).then(() => {
+            return resolve(profile);
+        }).catch(e => {
+            return reject(e);
         });
+    });
+}
+
+exports.getUserAnonymousKey = function (uid, postID) {
+    return new Promise((resolve, reject) => {
+        return resolve();
     });
 }
 
@@ -84,33 +97,21 @@ function generateAnonymousKeyForPost(uid, postID, attemped) {
                 key: key
             };
             flag = key in _attempted;
-            console.log("isKeyAttempted: ", flag);
         }
 
-        const postRef = firestore.collection("posts").doc(postID);
-        const getEntry = postRef.collection("lexicon").where("key", "==", anonObject.key).get();
-        getEntry.then(snapshot => {
-            console.log("SNAPSHOT IS EMPTY: ", snapshot.empty);
-            if (snapshot.empty) {
-                console.log(`ANON: ${anonObject.key} EMPTY -> RESOLVE`);
+
+        const getEntry = database.ref(`posts/lexicon/${postID}`).orderByChild('key').equalTo(anonObject.key).once('value');
+        return getEntry.then(snapshot => {
+            if (!snapshot.exists()) {
                 return Promise.resolve(anonObject);
             } else {
-                console.log(`ANON: ${anonObject.key} TAKEN -> RECURSE`);
                 _attempted[anonObject.key] = true;
                 return generateAnonymousKeyForPost(uid, postID, _attempted);
             }
         }).then(_anonObject => {
             anonObject = _anonObject;
-            const parentPostRef = firestore.collection('posts').doc(postID);
-            const lexiconRef = parentPostRef.collection('lexicon').doc(uid);
-            var lexiconObject = anonObject;
-            lexiconObject['uid'] = uid;
-            console.log("SETTING LEXICON!");
-
-            const setLexiconEntry = lexiconRef.set(lexiconObject);
-            const setLexiconMeta = database.ref(`posts/meta/${postID}/lexicon/${anonObject.key}`).set(uid);
-
-            return Promise.all([setLexiconEntry, setLexiconMeta]);
+            const setLexiconMeta = database.ref(`posts/lexicon/${postID}/${uid}`).set(anonObject);
+            return setLexiconMeta;
         }).then(() => {
             return resolve(anonObject);
         }).catch(error => {
