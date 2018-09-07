@@ -35,7 +35,7 @@ exports.anonymizeFile = function (inputFilePath, outputFilePath) {
 
 exports.getUserLexiconEntry = function (uid, postID, isAnon) {
     return new Promise((resolve, reject) => {
-        const getLexiconEntry = database.ref(`posts/lexicon/${postID}/${uid}`).once('value');
+        const getLexiconEntry = database.child(`posts/lexicon/${postID}/${uid}`).once('value');
         return getLexiconEntry.then(snapshot => {
             if (snapshot.exists()) {
                 return Promise.resolve(snapshot.val());
@@ -57,11 +57,12 @@ exports.getUserLexiconEntry = function (uid, postID, isAnon) {
 function setUserAuthorLexiconEntry(uid, postID) {
     return new Promise((resolve, reject) => {
         var profile;
-        const getUserProfile = database.ref(`users/profile/${uid}`).once('value');
+        const getUserProfile = database.child(`users/profile/${uid}`).once('value');
         return getUserProfile.then(_profile => {
             if (_profile.exists()) {
                 profile = _profile.val();
-                const setLexiconEntry = database.ref(`posts/lexicon/${postID}/${uid}`).set(profile);
+                profile['key'] = profile['username'].toLowerCase();
+                const setLexiconEntry = database.child(`posts/lexicon/${postID}/${uid}`).set(profile);
                 return setLexiconEntry;
             } else {
                 return Promise.reject('No user profile found');
@@ -89,7 +90,7 @@ function generateAnonymousKeyForPost(uid, postID, attemped) {
             const adjective = randomAdjective();
             const animal = randomAnimal();
             const color = randomColor();
-            const key = `${adjective}${animal}`;
+            const key = `${adjective}${animal}`.toLowerCase();
             anonObject = {
                 adjective: adjective,
                 animal: animal,
@@ -100,7 +101,7 @@ function generateAnonymousKeyForPost(uid, postID, attemped) {
         }
 
 
-        const getEntry = database.ref(`posts/lexicon/${postID}`).orderByChild('key').equalTo(anonObject.key).once('value');
+        const getEntry = database.child(`posts/lexicon/${postID}`).orderByChild('key').equalTo(anonObject.key).once('value');
         return getEntry.then(snapshot => {
             if (!snapshot.exists()) {
                 return Promise.resolve(anonObject);
@@ -110,7 +111,7 @@ function generateAnonymousKeyForPost(uid, postID, attemped) {
             }
         }).then(_anonObject => {
             anonObject = _anonObject;
-            const setLexiconMeta = database.ref(`posts/lexicon/${postID}/${uid}`).set(anonObject);
+            const setLexiconMeta = database.child(`posts/lexicon/${postID}/${uid}`).set(anonObject);
             return setLexiconMeta;
         }).then(() => {
             return resolve(anonObject);
@@ -121,6 +122,24 @@ function generateAnonymousKeyForPost(uid, postID, attemped) {
 
     });
 }
+
+exports.systemSaveAllAnonNames = function (systemDatabase) {
+    return new Promise((resolve, reject) => {
+        var updateobject = {};
+		for (var i = 0; i < adjectives.length; i++) {
+			for (var j = 0; j < animals.length; j++) {
+				const name = `${adjectives[i].toLowerCase()}${animals[j].toLowerCase()}`;
+				updateobject[`anon/names/${name}`] = true;
+			}
+		}
+		return systemDatabase.update(updateobject).then (() => {
+			return resolve();
+		}).catch( e => {
+			return reject(e);
+		})
+    });
+}
+
 
 function randomAdjective() {
     return adjectives[Math.floor(Math.random() * adjectives.length)];

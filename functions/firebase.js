@@ -33,5 +33,9 @@ exports.firestore = function () {
 };
 
 exports.database = function () {
-    return admin.database();
+    return admin.database().ref(`app`);
+};
+
+exports.systemDatabase = function () {
+    return admin.database().ref(`system`);
 };

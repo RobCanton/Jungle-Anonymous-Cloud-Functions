@@ -47,20 +47,20 @@ exports.sendNotification = function(admin, database, uid, title, body) {
     return new Promise((resolve, reject) => {
 
         var badgeCount = 0;
-        const getUserNotificationSettings = database.ref(`users/settings/${uid}/pushNotifications`).once('value');
+        const getUserNotificationSettings = database.child(`users/settings/${uid}/pushNotifications`).once('value');
         return getUserNotificationSettings.then(snapshot => {
             if (snapshot.exists()) {
                 if (snapshot.val() == false) {
                     return reject();
                 }
             }
-            const getUnseenNotifications = database.ref(`users/notifications/${uid}`).orderByChild('seen').equalTo(false).once('value');
+            const getUnseenNotifications = database.child(`users/notifications/${uid}`).orderByChild('seen').equalTo(false).once('value');
             return getUnseenNotifications;
         }).then(snapshot => {
 
             badgeCount = Number(snapshot.numChildren());
 
-            const getUserToken = database.ref(`users/fcmToken/${uid}`).once('value');
+            const getUserToken = database.child(`users/fcmToken/${uid}`).once('value');
             return getUserToken;
 
         }).then(snapshot => {
@@ -73,17 +73,13 @@ exports.sendNotification = function(admin, database, uid, title, body) {
                     "badge": `${badgeCount}`
                 }
             };
-
-
-            console.log("Send payload: ", payload);
-            console.log("TOKEN: ", token);
+			
             const sendPushNotification = admin.messaging().sendToDevice(token, payload);
             return sendPushNotification;
         }).then(() => {
-            console.log("ALL GOOD!");
             return resolve();
         }).catch(error => {
-            console.log("ERROR: ", error);
+            console.log("Error: ", error);
             return reject(error);
         });
     });
